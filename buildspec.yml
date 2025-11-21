@@ -1,0 +1,37 @@
+version: 0.2
+
+env:
+  variables:
+    REPO_URI: 123644281557.dkr.ecr.us-east-1.amazonaws.com/my-web-app
+    IMAGE_TAG: latest
+    AWS_DEFAULT_REGION: us-east-1
+
+phases:
+  install:
+    commands:
+      - echo "Install phase complete"
+
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REPO_URI
+      - echo "Pre-build phase complete"
+      - echo "Listing files in the current directory:"
+      - ls -al
+      - echo "Listing files in ./app (if exists):"
+      - ls -al ./app || echo "app folder not found"
+      - echo "Listing files in ./ (again for safety):"
+      - ls -al . || echo "Root folder empty"
+
+  build:
+    commands:
+      - echo "Build the Docker image"
+      - docker build -t my-web-app:$IMAGE_TAG ./app || echo "Docker build failed"
+
+  post_build:
+    commands:
+      - echo "Tagging the Docker image"
+      - docker tag my-web-app:$IMAGE_TAG $REPO_URI:$IMAGE_TAG || echo "Docker tag failed"
+      - echo "Pushing the Docker image"
+      - docker push $REPO_URI:$IMAGE_TAG || echo "Docker push failed"
+      - echo "Post-build phase complete"
