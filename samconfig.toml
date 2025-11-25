@@ -1,14 +1,13 @@
 version = 0.1
 
 [default.deploy.parameters]
-stack_name = "ecr-ecs-web-app-stack"
+stack_name = "ecs-ecr-docchat-stack"
 resolve_s3 = true
-s3_prefix = "ecr-ecs-web-app-stack"
-region = "us-east-1"
+s3_prefix = "ecs-ecr-docchat-stack"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
 disable_rollback = true
-parameter_overrides = "ImageUri=\"nginx\" DesiredCount=\"2\" ContainerPort=\"80\" EcrRepositoryName=\"ecr-ecs-web-app\""
+parameter_overrides = "DocImageUri=\"nginx\" DesiredCount=\"2\" ContainerPort=\"80\" BedrockModelId=\"arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0\" DDBTableName=\"docchat-conversations\" UploadBucketName=\"docchat-uploads-bucket\" VpcCidr=\"10.0.0.0/16\""
 image_repositories = []
 
 [default.global.parameters]

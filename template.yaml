@@ -1,26 +1,39 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: ECS (Fargate) + ECR deployment via SAM/CloudFormation.
+Description: DocChat — ECS (Fargate) web app using AWS Bedrock (ALB + ECR + S3 + DynamoDB)
 
 Parameters:
-  ImageUri:
+  DocImageUri:
     Type: String
-    Description: "Full ECR image URI (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:latest)"
+    Description: "Full ECR image URI for DocChat (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/docchat-web:latest)"
   DesiredCount:
     Type: Number
     Default: 2
   ContainerPort:
     Type: Number
     Default: 80
-  EcrRepositoryName:
+  BedrockModelId:
     Type: String
-    Default: ecr-ecs-web-app
+    Default: arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0
+    Description: "Bedrock model id used by the service (e.g. amazon.titan-text-001)"
+  DDBTableName:
+    Type: String
+    Default: docchat-conversations
+  UploadBucketName:
+    Type: String
+    Default: docchat-uploads-bucket
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
 
 Resources:
 
+  #################################
+  # Network: VPC, Subnets, NAT, IGW
+  #################################
   MyVPC:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: 10.0.0.0/16
+      CidrBlock: !Ref VpcCidr
       EnableDnsSupport: true
       EnableDnsHostnames: true
       Tags:
@@ -45,7 +58,7 @@ Resources:
       AvailabilityZone: !Select [0, !GetAZs ""]
       Tags:
         - Key: Name
-          Value: PublicSubnet1
+          Value: !Sub "${AWS::StackName}-public-1"
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
@@ -56,7 +69,29 @@ Resources:
       AvailabilityZone: !Select [1, !GetAZs ""]
       Tags:
         - Key: Name
-          Value: PublicSubnet2
+          Value: !Sub "${AWS::StackName}-public-2"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.4.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-2"
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
@@ -82,28 +117,6 @@ Resources:
     Properties:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
-
-  PrivateSubnet1:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref MyVPC
-      CidrBlock: 10.0.3.0/24
-      MapPublicIpOnLaunch: false
-      AvailabilityZone: !Select [0, !GetAZs ""]
-      Tags:
-        - Key: Name
-          Value: PrivateSubnet1
-
-  PrivateSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref MyVPC
-      CidrBlock: 10.0.4.0/24
-      MapPublicIpOnLaunch: false
-      AvailabilityZone: !Select [1, !GetAZs ""]
-      Tags:
-        - Key: Name
-          Value: PrivateSubnet2
 
   NatGatewayEIP:
     Type: AWS::EC2::EIP
@@ -140,18 +153,48 @@ Resources:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
 
-  # (Create ECR repo so the URI exists — optional but helpful)
-  EcrRepository:
+  ####################
+  # Storage & Database
+  ####################
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref UploadBucketName
+      VersioningConfiguration:
+        Status: Suspended
+
+  DocChatTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DDBTableName
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ##############
+  # ECR repo
+  ##############
+  DocChatEcrRepo:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: !Ref EcrRepositoryName
+      RepositoryName: !Sub "${AWS::StackName}-docchat"
 
+  ####################
+  # Logging
+  ####################
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/ecs/${AWS::StackName}"
       RetentionInDays: 14
 
+  ####################
+  # IAM Roles
+  ####################
   ECSTaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -160,18 +203,69 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: ecs-tasks.amazonaws.com
+              Service:
+                - ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
 
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DocChatTaskPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Bedrock invocation
+              - Effect: Allow
+                Action:
+                  - bedrock-runtime:InvokeModel
+                Resource: "*"
+              # S3 (uploads)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt UploadBucket.Arn
+                  - !Sub "${UploadBucket.Arn}/*"
+              # DynamoDB table actions
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt DocChatTable.Arn
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/*"
+
+  ####################
+  # ECS Cluster + ALB + Security Groups
+  ####################
   AppCluster:
     Type: AWS::ECS::Cluster
 
   LoadBalancerSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: ALB SG
+      GroupDescription: ALB security group
       VpcId: !Ref MyVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -182,7 +276,7 @@ Resources:
   ContainerSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: ECS Task SG
+      GroupDescription: ECS task security group
       VpcId: !Ref MyVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -219,36 +313,50 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref AppTargetGroup
 
-  AppTaskDefinition:
+  ####################
+  # ECS Task Definition & Service (DocChat)
+  ####################
+  DocChatTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Cpu: '256'
-      Memory: '512'
+      Cpu: '512'
+      Memory: '1024'
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
       ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
       ContainerDefinitions:
-        - Name: my-app
-          Image: !Ref ImageUri
+        - Name: docchat-web
+          Image: !Ref DocImageUri
           Essential: true
           PortMappings:
             - ContainerPort: !Ref ContainerPort
+          Environment:
+            - Name: BEDROCK_MODEL_ID
+              Value: !Ref BedrockModelId
+            - Name: DDB_TABLE
+              Value: !Ref DDBTableName
+            - Name: S3_BUCKET
+              Value: !Ref UploadBucketName
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref "AWS::Region"
           LogConfiguration:
             LogDriver: awslogs
             Options:
               awslogs-group: !Ref LogGroup
               awslogs-region: !Ref "AWS::Region"
-              awslogs-stream-prefix: !Sub "${AWS::StackName}"
-  AppService:
+              awslogs-stream-prefix: !Sub "${AWS::StackName}-web"
+
+  DocChatService:
     Type: AWS::ECS::Service
     DependsOn: AppListener
     Properties:
-      ServiceName: !Sub "${AWS::StackName}-service"
+      ServiceName: !Sub "${AWS::StackName}-docchat-service"
       Cluster: !Ref AppCluster
       LaunchType: FARGATE
       DesiredCount: !Ref DesiredCount
-      TaskDefinition: !Ref AppTaskDefinition
+      TaskDefinition: !Ref DocChatTaskDefinition
       DeploymentConfiguration:
         MaximumPercent: 200
         MinimumHealthyPercent: 50
@@ -262,22 +370,30 @@ Resources:
             - !Ref ContainerSG
       LoadBalancers:
         - TargetGroupArn: !Ref AppTargetGroup
-          ContainerName: my-app
+          ContainerName: docchat-web
           ContainerPort: !Ref ContainerPort
 
 Outputs:
   EcrRepositoryUri:
-    Description: "ECR repo URI (without tag)"
-    Value: !GetAtt EcrRepository.RepositoryUri
+    Description: "ECR repo URI"
+    Value: !GetAtt DocChatEcrRepo.RepositoryUri
 
   ALBUrl:
-    Description: "URL for the Application Load Balancer"
+    Description: "Application Load Balancer URL"
     Value: !Join ["", ["http://", !GetAtt AppALB.DNSName]]
 
   ClusterName:
-    Description: ECS Cluster name
+    Description: "ECS Cluster name"
     Value: !Ref AppCluster
 
   ServiceName:
-    Description: ECS Service name
-    Value: !Ref AppService
+    Description: "DocChat ECS service name"
+    Value: !Ref DocChatService
+
+  UploadBucket:
+    Description: "S3 Bucket name for uploads"
+    Value: !Ref UploadBucket
+
+  ConversationTable:
+    Description: "DynamoDB table name for conversation history"
+    Value: !Ref DocChatTable
