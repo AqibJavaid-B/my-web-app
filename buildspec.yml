@@ -2,7 +2,7 @@ version: 0.2
 
 env:
   variables:
-    REPO_URI: 123644281557.dkr.ecr.us-east-1.amazonaws.com/my-web-app
+    REPO_URI: 123644281557.dkr.ecr.us-east-1.amazonaws.com/ecr-ecs-web-app
     IMAGE_TAG: latest
     AWS_DEFAULT_REGION: us-east-1
 
