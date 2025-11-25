@@ -1,13 +1,14 @@
 version = 0.1
 
 [default.deploy.parameters]
-stack_name = "my-ecs-stack"
+stack_name = "ecr-ecs-web-app-stack"
 resolve_s3 = true
-s3_prefix = "my-ecs-stack"
+s3_prefix = "ecr-ecs-web-app-stack"
+region = "us-east-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
 disable_rollback = true
-parameter_overrides = "ImageUri=\"nginx\" VpcId=\"vpc-0d95093e514ad6220\" PublicSubnet1=\"subnet-06153b55d5097222c\" PublicSubnet2=\"subnet-03cb078d83045fa10\" PrivateSubnet1=\"subnet-0820b2792f9b0cf0e\" PrivateSubnet2=\"subnet-0a0e01f6a19c66683\" DesiredCount=\"0\" ContainerPort=\"80\" EcrRepositoryName=\"my-web-app\""
+parameter_overrides = "ImageUri=\"nginx\" DesiredCount=\"2\" ContainerPort=\"80\" EcrRepositoryName=\"ecr-ecs-web-app\""
 image_repositories = []
 
 [default.global.parameters]

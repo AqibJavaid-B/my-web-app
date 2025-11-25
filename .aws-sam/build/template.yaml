@@ -1,0 +1,320 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS (Fargate) + ECR deployment via SAM/CloudFormation.
+Parameters:
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:latest)
+  DesiredCount:
+    Type: Number
+    Default: 2
+  ContainerPort:
+    Type: Number
+    Default: 80
+  EcrRepositoryName:
+    Type: String
+    Default: ecr-ecs-web-app
+Resources:
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${AWS::StackName}-vpc
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: MyVPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: MyVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: ''
+      Tags:
+      - Key: Name
+        Value: PublicSubnet1
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: MyVPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+        - 1
+        - Fn::GetAZs: ''
+      Tags:
+      - Key: Name
+        Value: PublicSubnet2
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: MyVPC
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId:
+        Ref: InternetGateway
+  PublicSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet1
+      RouteTableId:
+        Ref: PublicRouteTable
+  PublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet2
+      RouteTableId:
+        Ref: PublicRouteTable
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: MyVPC
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: ''
+      Tags:
+      - Key: Name
+        Value: PrivateSubnet1
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: MyVPC
+      CidrBlock: 10.0.4.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone:
+        Fn::Select:
+        - 1
+        - Fn::GetAZs: ''
+      Tags:
+      - Key: Name
+        Value: PrivateSubnet2
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+        - NatGatewayEIP
+        - AllocationId
+      SubnetId:
+        Ref: PublicSubnet1
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: MyVPC
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId:
+        Ref: NatGateway
+  PrivateSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateSubnet1
+      RouteTableId:
+        Ref: PrivateRouteTable
+  PrivateSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateSubnet2
+      RouteTableId:
+        Ref: PrivateRouteTable
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName:
+        Ref: EcrRepositoryName
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /ecs/${AWS::StackName}
+      RetentionInDays: 14
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  AppCluster:
+    Type: AWS::ECS::Cluster
+  LoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB SG
+      VpcId:
+        Ref: MyVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: '0.0.0.0/0'
+  ContainerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Task SG
+      VpcId:
+        Ref: MyVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId:
+          Ref: LoadBalancerSG
+  AppALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Ref: PublicSubnet1
+      - Ref: PublicSubnet2
+      SecurityGroups:
+      - Ref: LoadBalancerSG
+      Scheme: internet-facing
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port:
+        Ref: ContainerPort
+      Protocol: HTTP
+      VpcId:
+        Ref: MyVPC
+      TargetType: ip
+      HealthCheckPath: /
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn:
+        Ref: AppALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: AppTargetGroup
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+      - FARGATE
+      ExecutionRoleArn:
+        Fn::GetAtt:
+        - ECSTaskExecutionRole
+        - Arn
+      ContainerDefinitions:
+      - Name: my-app
+        Image:
+          Ref: ImageUri
+        Essential: true
+        PortMappings:
+        - ContainerPort:
+            Ref: ContainerPort
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: LogGroup
+            awslogs-region:
+              Ref: AWS::Region
+            awslogs-stream-prefix:
+              Fn::Sub: ${AWS::StackName}
+  AppService:
+    Type: AWS::ECS::Service
+    DependsOn: AppListener
+    Properties:
+      ServiceName:
+        Fn::Sub: ${AWS::StackName}-service
+      Cluster:
+        Ref: AppCluster
+      LaunchType: FARGATE
+      DesiredCount:
+        Ref: DesiredCount
+      TaskDefinition:
+        Ref: AppTaskDefinition
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+          - Ref: PrivateSubnet1
+          - Ref: PrivateSubnet2
+          SecurityGroups:
+          - Ref: ContainerSG
+      LoadBalancers:
+      - TargetGroupArn:
+          Ref: AppTargetGroup
+        ContainerName: my-app
+        ContainerPort:
+          Ref: ContainerPort
+Outputs:
+  EcrRepositoryUri:
+    Description: ECR repo URI (without tag)
+    Value:
+      Fn::GetAtt:
+      - EcrRepository
+      - RepositoryUri
+  ALBUrl:
+    Description: URL for the Application Load Balancer
+    Value:
+      Fn::Join:
+      - ''
+      - - http://
+        - Fn::GetAtt:
+          - AppALB
+          - DNSName
+  ClusterName:
+    Description: ECS Cluster name
+    Value:
+      Ref: AppCluster
+  ServiceName:
+    Description: ECS Service name
+    Value:
+      Ref: AppService
