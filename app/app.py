@@ -174,7 +174,8 @@ def save_doc_to_s3_and_dynamo(file_obj, filename):
     # Save metadata
     table = dynamodb.Table(DDB_TABLE)
     item = {
-        "doc_id": doc_id,
+        "id": doc_id,                    # primary key required by your table
+        "doc_id": doc_id,                # keep doc_id too (optional)
         "s3_key": s3_key,
         "filename": filename,
         "excerpt_s3_key": excerpt_key or "",
@@ -193,7 +194,7 @@ def get_doc_excerpt(doc_id):
         return None
     table = dynamodb.Table(DDB_TABLE)
     try:
-        resp = table.get_item(Key={"doc_id": doc_id})
+        resp = table.get_item(Key={"id": doc_id})
     except Exception as e:
         app.logger.exception("DynamoDB get_item failed: %s", e)
         return None
