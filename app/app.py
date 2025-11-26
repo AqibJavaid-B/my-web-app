@@ -62,46 +62,110 @@ def get_bedrock_client():
         return None
 
 
-def call_bedrock(prompt, max_retries=2, backoff_sec=0.5):
+def call_bedrock(prompt, max_retries=2, backoff_sec=0.5, system_message=None):
     """
-    Calls Bedrock runtime using lazy client. Returns the text response.
-    Raises RuntimeError if client not available.
+    Invoke Bedrock in a model-aware way:
+      - For OpenAI-compatible models (openai.gpt-oss-...), send an OpenAI Chat-style payload
+        with "messages": [system, user].
+      - Otherwise send a simple JSON fallback with {"input": "..."}.
+
+    Returns the model text output (string). Raises the last exception if all attempts fail.
     """
     client = get_bedrock_client()
     if client is None:
         raise RuntimeError("Bedrock client not available. Check boto3/botocore version and container network/region.")
 
-    payload = {"text": prompt}
+    # very small safety trim for extremely long docs (prefer smarter chunking/RAG in production)
+    MAX_INPUT_CHARS = 60_000  # tune to your model tokens; keep conservative
+    if len(prompt) > MAX_INPUT_CHARS:
+        prompt = prompt[-MAX_INPUT_CHARS:]  # keep last chunk (or implement smarter chunking)
+
+    model_id = BEDROCK_MODEL_ID or ""
     last_exc = None
+
+    # Build payload according to model family
+    if model_id.startswith("openai.") or model_id.startswith("openai.gpt-oss") or "gpt-oss" in model_id:
+        # OpenAI compatible chat/completions request body (recommended for GPT-OSS models).
+        system_msg = system_message or "You are a helpful assistant that answers questions about the provided document. Be concise and don't hallucinate."
+        native_request = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": prompt}
+            ],
+            # you can expose these as env vars later
+            "max_completion_tokens": 512,
+            "temperature": 0.0
+        }
+        body_bytes_to_send = json.dumps(native_request).encode("utf-8")
+    else:
+        # Generic fallback: most other models accept a simple JSON with "input" or "text" as object.
+        # Some models require different shapes (Anthropic, Titan, etc.) — adapt per-model if needed.
+        fallback_request = {
+            "input": prompt,
+        }
+        body_bytes_to_send = json.dumps(fallback_request).encode("utf-8")
+
     for attempt in range(1, max_retries + 1):
         try:
             resp = client.invoke_model(
-                modelId=BEDROCK_MODEL_ID,
+                modelId=model_id,
                 contentType="application/json",
                 accept="application/json",
-                body=json.dumps(payload).encode("utf-8"),
+                body=body_bytes_to_send
             )
             body_bytes = resp.get("body").read()
+
+            # Robust parsing (try to extract textual content; compatible with OpenAI-style response)
             text = None
             try:
                 j = json.loads(body_bytes.decode("utf-8"))
+                # OpenAI-style: response_body['choices'][i]['message']['content'] or 'choices' -> 'text'
                 if isinstance(j, dict):
-                    if "results" in j and isinstance(j["results"], list) and j["results"]:
-                        candidate = j["results"][0]
-                        if isinstance(candidate, dict) and "outputText" in candidate:
-                            text = candidate["outputText"]
-                    if not text and "content" in j:
-                        text = j["content"]
-                    if not text and "output" in j:
-                        text = j["output"]
+                    # choices -> message -> content
+                    if "choices" in j and isinstance(j["choices"], list) and j["choices"]:
+                        # iterate until we find content
+                        for ch in j["choices"]:
+                            # usual shape: { "message": {"content": "..." } }
+                            if isinstance(ch, dict) and "message" in ch and isinstance(ch["message"], dict):
+                                cont = ch["message"].get("content")
+                                if isinstance(cont, str):
+                                    text = cont
+                                    break
+                            # alternate shape: { "text": "..." } or { "message": {"content": [{"text":"..."}]}} etc.
+                            if isinstance(ch, dict) and "text" in ch and isinstance(ch["text"], str):
+                                text = ch["text"]
+                                break
+                            # sometimes content is list
+                            if isinstance(ch, dict) and "message" in ch and isinstance(ch["message"], dict):
+                                mcont = ch["message"].get("content")
+                                if isinstance(mcont, list) and len(mcont) > 0 and isinstance(mcont[0], dict):
+                                    # e.g., [{'text': '...'}]
+                                    t0 = mcont[0].get("text")
+                                    if isinstance(t0, str):
+                                        text = t0
+                                        break
+                    # common Bedrock shapes: top-level 'results' -> first -> 'outputText' or 'content' fields
+                    if text is None:
+                        if "results" in j and isinstance(j["results"], list) and j["results"]:
+                            r0 = j["results"][0]
+                            if isinstance(r0, dict) and "outputText" in r0:
+                                text = r0.get("outputText")
+                        if text is None and "output" in j and isinstance(j["output"], str):
+                            text = j["output"]
+                        if text is None and "content" in j and isinstance(j["content"], str):
+                            text = j["content"]
                 if text is None:
+                    # fallback: stringify the JSON body so the app still shows something
                     text = json.dumps(j)
             except Exception:
+                # final fallback: decode bytes directly
                 try:
                     text = body_bytes.decode("utf-8", errors="ignore")
                 except Exception:
                     text = str(body_bytes)
-            return text.strip()
+
+            return text.strip() if text is not None else ""
         except Exception as e:
             last_exc = e
             app.logger.warning("Bedrock invoke_model attempt %d failed: %s", attempt, e)
@@ -109,6 +173,7 @@ def call_bedrock(prompt, max_retries=2, backoff_sec=0.5):
 
     app.logger.exception("Bedrock invocation failed after %d attempts. Last error: %s", max_retries, last_exc)
     raise last_exc
+
 
 
 # === Helpers: PDF/text extraction, S3, DynamoDB ===
