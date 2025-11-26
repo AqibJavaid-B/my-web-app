@@ -4,6 +4,7 @@ import logging
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 import boto3
 from botocore.config import Config
+from botocore.exceptions import UnknownServiceError
 from urllib.parse import unquote_plus
 from datetime import datetime
 import uuid
@@ -15,7 +16,32 @@ logger = logging.getLogger(__name__)
 # Bedrock client
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0")
 BEDROCK_TIMEOUT_CONFIG = Config(read_timeout=60, connect_timeout=5, retries={"max_attempts": 2})
-bedrock = boto3.client("bedrock-runtime", config=BEDROCK_TIMEOUT_CONFIG)
+# bedrock = boto3.client("bedrock-runtime", config=BEDROCK_TIMEOUT_CONFIG)
+
+# Lazy-initialized bedrock client
+_bedrock_client = None
+_bedrock_available = None
+
+def get_bedrock_client():
+    global _bedrock_client, _bedrock_available
+    if _bedrock_available is False:
+        return None
+    if _bedrock_client is not None:
+        return _bedrock_client
+    try:
+        _bedrock_client = boto3.client("bedrock-runtime", config=BEDROCK_TIMEOUT_CONFIG)
+        _bedrock_available = True
+        return _bedrock_client
+    except UnknownServiceError:
+        # SDK doesn't know about bedrock-runtime (old botocore)
+        _bedrock_available = False
+        app.logger.error("Bedrock client not available (UnknownServiceError). Upgrade boto3/botocore in the image.")
+        return None
+    except Exception as e:
+        # other errors (e.g., misconfigured region)
+        _bedrock_available = False
+        app.logger.exception("Failed to create bedrock client: %s", e)
+        return None
 
 # DynamoDB table for conversation history (optional)
 DDB_TABLE = os.environ.get("DDB_TABLE")
@@ -69,47 +95,57 @@ def prompt_for_question(doc_text, question, max_context_chars=3000):
     )
     return prompt
 
-def call_bedrock(prompt):
+def call_bedrock(prompt, max_retries=2, backoff_sec=0.5):
     """
-    Calls Bedrock runtime with a simple text payload. Adjust contentType/accept if you use chat format models.
-    Returns the raw text response.
+    Calls Bedrock runtime using the lazy client factory.
+    Returns the raw text response (str).
+    Raises RuntimeError if Bedrock client is not available.
     """
-    try:
-        payload = {"text": prompt}
-        resp = bedrock.invoke_model(
-            modelId=BEDROCK_MODEL_ID,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(payload).encode("utf-8")
-        )
-        # resp['body'] is a streaming Body: read it
-        body_bytes = resp.get("body").read()
-        text = None
+    client = get_bedrock_client()
+    if client is None:
+        raise RuntimeError("Bedrock client not available. Check boto3/botocore version and container network/region.")
+
+    payload = {"text": prompt}
+    last_exc = None
+
+    for attempt in range(1, max_retries + 1):
         try:
-            j = json.loads(body_bytes.decode("utf-8"))
-            # common shapes: { "results":[{"outputText":"..."}] } or {"content": "..."} or plain text
-            if isinstance(j, dict):
-                # try several places
-                if "results" in j and isinstance(j["results"], list) and j["results"]:
-                    candidate = j["results"][0]
-                    if isinstance(candidate, dict) and "outputText" in candidate:
-                        text = candidate["outputText"]
-                if not text and "content" in j:
-                    text = j["content"]
-                if not text and "output" in j:
-                    text = j["output"]
-            if text is None:
-                text = json.dumps(j)
-        except Exception:
-            # fallback: decode bytes directly
+            resp = client.invoke_model(
+                modelId=BEDROCK_MODEL_ID,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(payload).encode("utf-8")
+            )
+            body_bytes = resp.get("body").read()
+            # --- existing robust parsing logic (copied from your function) ---
+            text = None
             try:
-                text = body_bytes.decode("utf-8", errors="ignore")
-            except:
-                text = str(body_bytes)
-        return text.strip()
-    except Exception as e:
-        logger.exception("Bedrock call failed: %s", e)
-        raise
+                j = json.loads(body_bytes.decode("utf-8"))
+                if isinstance(j, dict):
+                    if "results" in j and isinstance(j["results"], list) and j["results"]:
+                        candidate = j["results"][0]
+                        if isinstance(candidate, dict) and "outputText" in candidate:
+                            text = candidate["outputText"]
+                    if not text and "content" in j:
+                        text = j["content"]
+                    if not text and "output" in j:
+                        text = j["output"]
+                if text is None:
+                    text = json.dumps(j)
+            except Exception:
+                try:
+                    text = body_bytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    text = str(body_bytes)
+            return text.strip()
+        except Exception as e:
+            last_exc = e
+            app.logger.warning("Bedrock invoke_model attempt %d failed: %s", attempt, e)
+            time.sleep(backoff_sec * (2 ** (attempt - 1)))
+
+    # If all retries failed, log and raise
+    app.logger.exception("Bedrock invocation failed after %d attempts. Last error: %s", max_retries, last_exc)
+    raise last_exc
 
 def save_conversation(doc_id, question, answer):
     if not DDB_TABLE:
