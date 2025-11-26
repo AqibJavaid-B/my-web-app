@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 # === Config / env ===
 BEDROCK_MODEL_ID = os.environ.get(
     "BEDROCK_MODEL_ID",
-    "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0",
+    #"arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-oss-120b-1:0",
+    "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0",
 )
 BEDROCK_TIMEOUT_CONFIG = Config(read_timeout=60, connect_timeout=5, retries={"max_attempts": 2})
 
