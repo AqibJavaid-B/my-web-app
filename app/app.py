@@ -63,80 +63,85 @@ def get_bedrock_client():
         return None
 
 
-def call_bedrock(prompt, max_retries=2, backoff_sec=0.5, system_message=None):
+def call_bedrock(prompt, max_retries=2, backoff_sec=0.5, system_message=None, params=None):
     """
-    Model-aware Bedrock invoke:
-      - For OpenAI-compatible and Nova models, send chat-style {"messages": [...]}
-      - Otherwise send a generic {"input": "..."} fallback.
+    Model-aware Bedrock invoke that sends a minimal allowed payload per model family.
+    - For OpenAI/GPT-OSS/Nova families: send {"model": modelId, "messages": [...]}
+      plus optionally a single allowed param "temperature" if provided in params.
+    - Otherwise send {"input": prompt} as a generic fallback.
 
-    Returns the model text (string) or raises the last exception if all attempts fail.
+    `params` may contain tuning keys (like {"temperature":0.0}) — they will only
+    be forwarded for families that accept them (conservative).
     """
     client = get_bedrock_client()
     if client is None:
         raise RuntimeError("Bedrock client not available. Check boto3/botocore version and container network/region.")
 
-    # safety trim for extremely long prompts (adjust as needed)
+    model_id = (BEDROCK_MODEL_ID or "")
+    model_id_lower = model_id.lower()
+    sys_msg = system_message or "You are a helpful assistant that answers questions about the provided document. Be concise and do not hallucinate."
+    params = params or {}
+
+    # Trim huge prompts to avoid excessive body sizes — prefer chunking / RAG for production.
     MAX_INPUT_CHARS = 60000
     if len(prompt) > MAX_INPUT_CHARS:
         prompt = prompt[-MAX_INPUT_CHARS:]
 
-    model_id = (BEDROCK_MODEL_ID or "").lower()
-    last_exc = None
+    # Decide family and build minimal payloads
+    is_openai_like = model_id_lower.startswith("openai.") or "gpt-oss" in model_id_lower
+    is_nova = "amazon.nova" in model_id_lower or model_id_lower.startswith("amazon.nova")
 
-    # decide payload shape
-    needs_messages = False
-    if model_id.startswith("openai.") or "gpt-oss" in model_id or model_id.startswith("openai") or "nova" in model_id:
-        # cover openai.gpt-oss-*, openai.*, and amazon.nova-* family
-        needs_messages = True
-
-    if needs_messages:
-        sys_msg = system_message or "You are a helpful assistant that answers questions about the provided document. Be concise and do not hallucinate."
+    if is_openai_like or is_nova:
+        # minimal chat payload (no extraneous keys)
         payload_obj = {
-            "model": BEDROCK_MODEL_ID,
+            "model": model_id,
             "messages": [
                 {"role": "system", "content": sys_msg},
                 {"role": "user",   "content": prompt}
-            ],
-            # optional model options you can tune
-            "max_completion_tokens": 512,
-            "temperature": 0.0
+            ]
         }
+        # conservative: allow only 'temperature' as an extra tuning param here (if provided)
+        if "temperature" in params:
+            try:
+                payload_obj["temperature"] = float(params["temperature"])
+            except Exception:
+                pass
     else:
+        # Generic fallback: simple input wrapper
         payload_obj = {"input": prompt}
 
     body_bytes_to_send = json.dumps(payload_obj).encode("utf-8")
 
+    last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
             resp = client.invoke_model(
-                modelId=BEDROCK_MODEL_ID,
+                modelId=model_id,
                 contentType="application/json",
                 accept="application/json",
-                body=body_bytes_to_send,
+                body=body_bytes_to_send
             )
             body_bytes = resp.get("body").read()
 
-            # --- robust parsing (tries a few common response shapes) ---
+            # Robust parsing
             text = None
             try:
                 j = json.loads(body_bytes.decode("utf-8"))
                 if isinstance(j, dict):
-                    # OpenAI-style responses
-                    if "choices" in j and isinstance(j["choices"], list) and j["choices"]:
+                    # OpenAI-style: choices -> message -> content or choices[].text
+                    if "choices" in j and isinstance(j["choices"], list):
                         for ch in j["choices"]:
                             if isinstance(ch, dict):
-                                # chat-style: message.content
                                 msg = ch.get("message")
                                 if isinstance(msg, dict):
                                     cont = msg.get("content")
                                     if isinstance(cont, str):
                                         text = cont
                                         break
-                                # plain completion: text
                                 if "text" in ch and isinstance(ch["text"], str):
                                     text = ch["text"]
                                     break
-                    # bedrock "results" style
+                    # Bedrock style results -> outputText/content
                     if text is None and "results" in j and isinstance(j["results"], list) and j["results"]:
                         r0 = j["results"][0]
                         if isinstance(r0, dict):
@@ -166,6 +171,7 @@ def call_bedrock(prompt, max_retries=2, backoff_sec=0.5, system_message=None):
 
     app.logger.exception("Bedrock invocation failed after %d attempts. Last error: %s", max_retries, last_exc)
     raise last_exc
+
 
 
 
