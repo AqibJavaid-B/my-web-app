@@ -65,102 +65,94 @@ def get_bedrock_client():
 
 def call_bedrock(prompt, max_retries=2, backoff_sec=0.5, system_message=None):
     """
-    Invoke Bedrock in a model-aware way:
-      - For OpenAI-compatible models (openai.gpt-oss-...), send an OpenAI Chat-style payload
-        with "messages": [system, user].
-      - Otherwise send a simple JSON fallback with {"input": "..."}.
+    Model-aware Bedrock invoke:
+      - For OpenAI-compatible and Nova models, send chat-style {"messages": [...]}
+      - Otherwise send a generic {"input": "..."} fallback.
 
-    Returns the model text output (string). Raises the last exception if all attempts fail.
+    Returns the model text (string) or raises the last exception if all attempts fail.
     """
     client = get_bedrock_client()
     if client is None:
         raise RuntimeError("Bedrock client not available. Check boto3/botocore version and container network/region.")
 
-    # very small safety trim for extremely long docs (prefer smarter chunking/RAG in production)
-    MAX_INPUT_CHARS = 60_000  # tune to your model tokens; keep conservative
+    # safety trim for extremely long prompts (adjust as needed)
+    MAX_INPUT_CHARS = 60000
     if len(prompt) > MAX_INPUT_CHARS:
-        prompt = prompt[-MAX_INPUT_CHARS:]  # keep last chunk (or implement smarter chunking)
+        prompt = prompt[-MAX_INPUT_CHARS:]
 
-    model_id = BEDROCK_MODEL_ID or ""
+    model_id = (BEDROCK_MODEL_ID or "").lower()
     last_exc = None
 
-    # Build payload according to model family
-    if model_id.startswith("openai.") or model_id.startswith("openai.gpt-oss") or "gpt-oss" in model_id:
-        # OpenAI compatible chat/completions request body (recommended for GPT-OSS models).
-        system_msg = system_message or "You are a helpful assistant that answers questions about the provided document. Be concise and don't hallucinate."
-        native_request = {
-            "model": model_id,
+    # decide payload shape
+    needs_messages = False
+    if model_id.startswith("openai.") or "gpt-oss" in model_id or model_id.startswith("openai") or "nova" in model_id:
+        # cover openai.gpt-oss-*, openai.*, and amazon.nova-* family
+        needs_messages = True
+
+    if needs_messages:
+        sys_msg = system_message or "You are a helpful assistant that answers questions about the provided document. Be concise and do not hallucinate."
+        payload_obj = {
+            "model": BEDROCK_MODEL_ID,
             "messages": [
-                {"role": "system", "content": system_msg},
+                {"role": "system", "content": sys_msg},
                 {"role": "user",   "content": prompt}
             ],
-            # you can expose these as env vars later
+            # optional model options you can tune
             "max_completion_tokens": 512,
             "temperature": 0.0
         }
-        body_bytes_to_send = json.dumps(native_request).encode("utf-8")
     else:
-        # Generic fallback: most other models accept a simple JSON with "input" or "text" as object.
-        # Some models require different shapes (Anthropic, Titan, etc.) — adapt per-model if needed.
-        fallback_request = {
-            "input": prompt,
-        }
-        body_bytes_to_send = json.dumps(fallback_request).encode("utf-8")
+        payload_obj = {"input": prompt}
+
+    body_bytes_to_send = json.dumps(payload_obj).encode("utf-8")
 
     for attempt in range(1, max_retries + 1):
         try:
             resp = client.invoke_model(
-                modelId=model_id,
+                modelId=BEDROCK_MODEL_ID,
                 contentType="application/json",
                 accept="application/json",
-                body=body_bytes_to_send
+                body=body_bytes_to_send,
             )
             body_bytes = resp.get("body").read()
 
-            # Robust parsing (try to extract textual content; compatible with OpenAI-style response)
+            # --- robust parsing (tries a few common response shapes) ---
             text = None
             try:
                 j = json.loads(body_bytes.decode("utf-8"))
-                # OpenAI-style: response_body['choices'][i]['message']['content'] or 'choices' -> 'text'
                 if isinstance(j, dict):
-                    # choices -> message -> content
+                    # OpenAI-style responses
                     if "choices" in j and isinstance(j["choices"], list) and j["choices"]:
-                        # iterate until we find content
                         for ch in j["choices"]:
-                            # usual shape: { "message": {"content": "..." } }
-                            if isinstance(ch, dict) and "message" in ch and isinstance(ch["message"], dict):
-                                cont = ch["message"].get("content")
-                                if isinstance(cont, str):
-                                    text = cont
-                                    break
-                            # alternate shape: { "text": "..." } or { "message": {"content": [{"text":"..."}]}} etc.
-                            if isinstance(ch, dict) and "text" in ch and isinstance(ch["text"], str):
-                                text = ch["text"]
-                                break
-                            # sometimes content is list
-                            if isinstance(ch, dict) and "message" in ch and isinstance(ch["message"], dict):
-                                mcont = ch["message"].get("content")
-                                if isinstance(mcont, list) and len(mcont) > 0 and isinstance(mcont[0], dict):
-                                    # e.g., [{'text': '...'}]
-                                    t0 = mcont[0].get("text")
-                                    if isinstance(t0, str):
-                                        text = t0
+                            if isinstance(ch, dict):
+                                # chat-style: message.content
+                                msg = ch.get("message")
+                                if isinstance(msg, dict):
+                                    cont = msg.get("content")
+                                    if isinstance(cont, str):
+                                        text = cont
                                         break
-                    # common Bedrock shapes: top-level 'results' -> first -> 'outputText' or 'content' fields
-                    if text is None:
-                        if "results" in j and isinstance(j["results"], list) and j["results"]:
-                            r0 = j["results"][0]
-                            if isinstance(r0, dict) and "outputText" in r0:
+                                # plain completion: text
+                                if "text" in ch and isinstance(ch["text"], str):
+                                    text = ch["text"]
+                                    break
+                    # bedrock "results" style
+                    if text is None and "results" in j and isinstance(j["results"], list) and j["results"]:
+                        r0 = j["results"][0]
+                        if isinstance(r0, dict):
+                            if "outputText" in r0:
                                 text = r0.get("outputText")
-                        if text is None and "output" in j and isinstance(j["output"], str):
-                            text = j["output"]
-                        if text is None and "content" in j and isinstance(j["content"], str):
-                            text = j["content"]
+                            elif "content" in r0:
+                                text = r0.get("content")
+                    # direct fields
+                    if text is None:
+                        for k in ("output","content","response","result"):
+                            if k in j and isinstance(j[k], str):
+                                text = j[k]
+                                break
                 if text is None:
-                    # fallback: stringify the JSON body so the app still shows something
                     text = json.dumps(j)
             except Exception:
-                # final fallback: decode bytes directly
                 try:
                     text = body_bytes.decode("utf-8", errors="ignore")
                 except Exception:
